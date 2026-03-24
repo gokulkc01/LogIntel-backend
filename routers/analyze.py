@@ -1,13 +1,14 @@
 import time
 import json
 import uuid
-from fastapi import APIRouter, Request
+from typing import Literal
+from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
-from core.schemas import AnalyzeRequest, AnalyzeResponse
-from core.parser import parse
+from core.schemas import AnalyzeOptions, AnalyzeRequest, AnalyzeResponse
+from core.parser import parse, parse_upload
 from core.detector import detect
 from core.log_analyzer import LogAnalyzer
 from core.risk_engine import compute_risk
@@ -22,6 +23,58 @@ limiter = Limiter(key_func=get_remote_address)
 CHUNK_SIZE = 50  # lines per streaming chunk
 
 
+def _merge_findings(base_findings, extra_findings):
+    existing = {(f.line, f.type) for f in base_findings}
+    for finding in extra_findings:
+        if (finding.line, finding.type) not in existing:
+            base_findings.append(finding)
+            existing.add((finding.line, finding.type))
+    return base_findings
+
+
+def _build_options(
+    mask: bool,
+    block_high_risk: bool,
+    log_analysis_enabled: bool,
+    session_id: str | None,
+):
+    return AnalyzeOptions(
+        mask=mask,
+        block_high_risk=block_high_risk,
+        log_analysis=log_analysis_enabled,
+        session_id=session_id or None,
+    )
+
+
+def _analyze_lines(lines, input_type: str, options: AnalyzeOptions, session_id: str):
+    regex_findings = detect(lines, mask=options.mask)
+    if options.log_analysis:
+        log_findings = LogAnalyzer(session_id).analyze(lines)
+        _merge_findings(regex_findings, log_findings)
+
+    store.add_session_findings(session_id, regex_findings)
+    cross_anomalies = store.get_cross_log_anomalies(session_id)
+    _merge_findings(regex_findings, cross_anomalies)
+
+    findings = sorted(regex_findings, key=lambda f: f.line)
+    risk_score, risk_level = compute_risk(findings)
+    excerpt = " ".join(t for _, t in lines[:20])
+    insights = get_insights(findings, excerpt)
+    summary = get_summary(findings, input_type)
+
+    result = AnalyzeResponse(
+        summary=summary,
+        content_type=input_type,
+        findings=findings,
+        risk_score=risk_score,
+        risk_level=risk_level,
+        action="allowed",
+        insights=insights
+    )
+
+    return apply_policy(result, options)
+
+
 @router.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(request: AnalyzeRequest):
     start = time.time()
@@ -30,45 +83,34 @@ async def analyze(request: AnalyzeRequest):
     session_id = getattr(request.options, "session_id", None) or "default"
 
     lines = parse(request)
-
-    # Single-pass detection — one LogAnalyzer instance sees all lines
-    regex_findings = detect(lines, mask=request.options.mask)
-    log_findings = LogAnalyzer(session_id).analyze(lines)
-
-    # Merge without duplicates
-    existing = {(f.line, f.type) for f in regex_findings}
-    for f in log_findings:
-        if (f.line, f.type) not in existing:
-            regex_findings.append(f)
-
-    # Cross-log anomaly detection
-    store.add_session_findings(session_id, regex_findings)
-    cross_anomalies = store.get_cross_log_anomalies(session_id)
-    for f in cross_anomalies:
-        regex_findings.append(f)
-
-    findings = sorted(regex_findings, key=lambda f: f.line)
-    risk_score, risk_level = compute_risk(findings)
-
-    excerpt = " ".join(t for _, t in lines[:20])
-    insights = get_insights(findings, excerpt)
-    summary = get_summary(findings, request.input_type)
-
-    result = AnalyzeResponse(
-        summary=summary,
-        content_type=request.input_type,
-        findings=findings,
-        risk_score=risk_score,
-        risk_level=risk_level,
-        action="allowed",
-        insights=insights
-    )
-
-    result = apply_policy(result, request.options)
+    result = _analyze_lines(lines, request.input_type, request.options, session_id)
+    risk_level = result.risk_level
+    findings = result.findings
 
     duration_ms = (time.time() - start) * 1000
     log_analysis(request.input_type, risk_level, len(findings), duration_ms)
 
+    return result
+
+
+@router.post("/analyze/upload", response_model=AnalyzeResponse)
+async def analyze_upload(
+    file: UploadFile = File(...),
+    input_type: Literal["text", "file", "sql", "chat", "log"] = Form(...),
+    mask: bool = Form(False),
+    block_high_risk: bool = Form(False),
+    log_analysis_enabled: bool = Form(True, alias="log_analysis"),
+    session_id: str | None = Form(None),
+):
+    start = time.time()
+    raw_bytes = await file.read()
+    options = _build_options(mask, block_high_risk, log_analysis_enabled, session_id)
+    resolved_session = options.session_id or "default"
+    lines = parse_upload(input_type, raw_bytes, file.filename)
+    result = _analyze_lines(lines, input_type, options, resolved_session)
+
+    duration_ms = (time.time() - start) * 1000
+    log_analysis(input_type, result.risk_level, len(result.findings), duration_ms)
     return result
 
 
@@ -85,7 +127,7 @@ async def analyze_stream(request: AnalyzeRequest):
         all_findings = []
 
         # KEY: single analyzer instance across ALL chunks — state persists
-        analyzer = LogAnalyzer(session_id)
+        analyzer = LogAnalyzer(session_id) if request.options.log_analysis else None
 
         for i in range(0, max(len(lines), 1), CHUNK_SIZE):
             chunk = lines[i:i + CHUNK_SIZE]
@@ -95,12 +137,10 @@ async def analyze_stream(request: AnalyzeRequest):
             # Regex detection on this chunk
             chunk_findings = detect(chunk, mask=request.options.mask)
 
-            # Stateful log analysis — analyzer remembers previous chunks
-            log_chunk_findings = analyzer.analyze(chunk)
-            existing = {(f.line, f.type) for f in chunk_findings}
-            for f in log_chunk_findings:
-                if (f.line, f.type) not in existing:
-                    chunk_findings.append(f)
+            if analyzer is not None:
+                # Stateful log analysis — analyzer remembers previous chunks
+                log_chunk_findings = analyzer.analyze(chunk)
+                _merge_findings(chunk_findings, log_chunk_findings)
 
             all_findings.extend(chunk_findings)
 
@@ -128,6 +168,80 @@ async def analyze_stream(request: AnalyzeRequest):
         excerpt = " ".join(t for _, t in lines[:20])
         insights = get_insights(all_findings, excerpt)
         summary = get_summary(all_findings, request.input_type)
+
+        final = {
+            "event": "complete",
+            "done": True,
+            "summary": summary,
+            "risk_score": risk_score,
+            "risk_level": risk_level,
+            "total_findings": len(all_findings),
+            "insights": insights,
+            "cross_log_anomalies": [f.model_dump() for f in cross_anomalies]
+        }
+        yield f"data: {json.dumps(final)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive"
+        }
+    )
+
+
+@router.post("/analyze/upload/stream")
+async def analyze_upload_stream(
+    file: UploadFile = File(...),
+    input_type: Literal["text", "file", "sql", "chat", "log"] = Form(...),
+    mask: bool = Form(False),
+    block_high_risk: bool = Form(False),
+    log_analysis_enabled: bool = Form(True, alias="log_analysis"),
+    session_id: str | None = Form(None),
+):
+    options = _build_options(mask, block_high_risk, log_analysis_enabled, session_id)
+    resolved_session = options.session_id or str(uuid.uuid4())
+    raw_bytes = await file.read()
+
+    async def event_generator():
+        lines = parse_upload(input_type, raw_bytes, file.filename)
+        all_findings = []
+        analyzer = LogAnalyzer(resolved_session) if options.log_analysis else None
+
+        for i in range(0, max(len(lines), 1), CHUNK_SIZE):
+            chunk = lines[i:i + CHUNK_SIZE]
+            chunk_num = i // CHUNK_SIZE + 1
+            total_chunks = (len(lines) + CHUNK_SIZE - 1) // CHUNK_SIZE
+
+            chunk_findings = detect(chunk, mask=options.mask)
+            if analyzer is not None:
+                log_chunk_findings = analyzer.analyze(chunk)
+                _merge_findings(chunk_findings, log_chunk_findings)
+
+            all_findings.extend(chunk_findings)
+
+            if chunk_findings:
+                payload = {
+                    "event": "findings",
+                    "chunk": chunk_num,
+                    "total_chunks": total_chunks,
+                    "findings": [f.model_dump() for f in chunk_findings],
+                    "done": False
+                }
+                yield f"data: {json.dumps(payload)}\n\n"
+            else:
+                yield f"data: {json.dumps({'event': 'progress', 'chunk': chunk_num, 'total_chunks': total_chunks, 'done': False})}\n\n"
+
+        store.add_session_findings(resolved_session, all_findings)
+        cross_anomalies = store.get_cross_log_anomalies(resolved_session)
+        all_findings.extend(cross_anomalies)
+
+        risk_score, risk_level = compute_risk(all_findings)
+        excerpt = " ".join(t for _, t in lines[:20])
+        insights = get_insights(all_findings, excerpt)
+        summary = get_summary(all_findings, input_type)
 
         final = {
             "event": "complete",

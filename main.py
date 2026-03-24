@@ -4,7 +4,11 @@ from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from dotenv import load_dotenv
+import os
 from routers.analyze import router
+
+load_dotenv()
 
 limiter = Limiter(key_func=get_remote_address, default_limits=["30/minute"])
 
@@ -32,7 +36,11 @@ async def limit_upload_size(request: Request, call_next):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=[
+        origin.strip()
+        for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
+        if origin.strip()
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

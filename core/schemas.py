@@ -6,6 +6,7 @@ class AnalyzeOptions(BaseModel):
     mask: bool = False
     block_high_risk: bool = False
     log_analysis: bool = True
+    session_id: Optional[str] = None
 
 
 class AnalyzeRequest(BaseModel):

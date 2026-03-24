@@ -12,6 +12,8 @@ _counters: dict[str, int] = {
     "high": 0,
     "medium": 0,
     "low": 0,
+    "ai_gateway_requests": 0,
+    "ai_gateway_fallbacks": 0,
 }
 _total_duration_ms: float = 0.0
 
@@ -34,6 +36,28 @@ def log_analysis(
         "finding_count": finding_count,
         "duration_ms": round(duration_ms, 2),
         "timestamp": time.time()
+    }))
+
+
+def log_ai_gateway_event(
+    provider: str,
+    model: str,
+    used_fallback: bool,
+    reason: str | None,
+    finding_count: int,
+) -> None:
+    _counters["ai_gateway_requests"] += 1
+    if used_fallback:
+        _counters["ai_gateway_fallbacks"] += 1
+
+    _logger.info(json.dumps({
+        "event": "ai_gateway_call",
+        "provider": provider,
+        "model": model,
+        "used_fallback": used_fallback,
+        "reason": reason,
+        "finding_count": finding_count,
+        "timestamp": time.time(),
     }))
 
 
